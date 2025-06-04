@@ -164,69 +164,88 @@ class SMUCourseSniper:
             if not self.get_election_params():
                 return False
 
-        # 构建选课请求
-        select_url = f"{self.jwxt_base_url}/shmtu/stdElectCourse!batchOperator.action?profileId={self.profile_id}&elecSessionTime={self.elec_session_time}"
+        # 第一步：先访问选课主页面，确保会话有效
+        try:
+            default_page_url = f"{self.jwxt_base_url}/shmtu/stdElectCourse!defaultPage.action?electionProfile.id={self.profile_id}"
+            default_response = self.session.get(default_page_url)
+            default_response.raise_for_status()
 
-        # 根据抓包结果构建请求数据
-        select_data = f"operator0={course_id}%3Atrue%3A0"
+            # 确保页面加载成功
+            if "选课" not in default_response.text:
+                logger.warning("无法正确加载选课页面，可能需要重新登录")
+                return False
 
-        headers = {
-            'X-Requested-With': 'XMLHttpRequest',
-            'Content-Type': 'application/x-www-form-urlencoded',
-            'Referer': f"{self.jwxt_base_url}/shmtu/stdElectCourse!defaultPage.action?electionProfile.id={self.profile_id}"
-        }
+            logger.info("已成功加载选课页面")
 
-        # 增加重试次数以应对临时性错误
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                response = self.session.post(select_url, data=select_data, headers=headers)
+            # 重新生成时间戳以确保有效性
+            self.elec_session_time = time.strftime("%Y%m%d%H%M%S", time.localtime())
 
-                # 检查HTTP状态码
-                if response.status_code != 200:
-                    logger.warning(f"选课请求HTTP状态码异常: {response.status_code}")
-                    time.sleep(1)  # 短暂等待后重试
-                    continue
+            # 第二步：发送选课请求
+            batch_url = f"{self.jwxt_base_url}/shmtu/stdElectCourse!batchOperator.action"
 
-                # 检查响应内容
-                if "NullPointerException" in response.text or "服务器内部错误" in response.text:
-                    logger.warning("服务器遇到空指针异常，正在重新获取选课参数并重试...")
-                    # 重新生成选课时间戳并重试
-                    self.elec_session_time = time.strftime("%Y%m%d%H%M%S", time.localtime())
-                    # 刷新选课页面以确保session有效
-                    refresh_resp = self.session.get(f"{self.jwxt_base_url}/shmtu/stdElectCourse!defaultPage.action?electionProfile.id={self.profile_id}")
-                    time.sleep(2)  # 等待更长时间
-                    continue
+            # 模拟真实浏览器请求头
+            headers = {
+                'X-Requested-With': 'XMLHttpRequest',
+                'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+                'Origin': self.jwxt_base_url,
+                'Referer': default_page_url,
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+                'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+                'Connection': 'keep-alive'
+            }
 
-                # 检查选课结果
-                if "成功" in response.text or "success" in response.text.lower():
-                    logger.info(f"成功选上课程 {course_id}")
-                    return True
-                elif "已选" in response.text:
-                    logger.info(f"课程 {course_id} 已经选过")
-                    return True
+            # 构建选课数据，与浏览器真实请求完全一致
+            # 检查请求数据格式是否正确 - 需特别注意参数顺序和格式
+            form_data = {
+                'profileId': self.profile_id,
+                'elecSessionTime': self.elec_session_time,
+                'operator0': f"{course_id}:true:0"
+            }
+
+            # 发送请求，设置超时以避免长时间挂起
+            response = self.session.post(
+                batch_url,
+                data=form_data,
+                headers=headers,
+                timeout=10
+            )
+
+            # 检查响应
+            if response.status_code != 200:
+                logger.error(f"选课请求返回异常状态码: {response.status_code}")
+                return False
+
+            # 如果返回HTML页面而非JSON数据，表示发生了错误
+            if "<!DOCTYPE html" in response.text or "<html" in response.text:
+                if "NullPointerException" in response.text:
+                    logger.error("服务器发生空指针异常，可能是请求参数格式不正确或服务器bug")
+                    # 记录请求详情以便调试
+                    logger.debug(f"请求URL: {batch_url}")
+                    logger.debug(f"请求数据: {form_data}")
                 else:
-                    # 记录更完整的错误信息
-                    error_message = response.text.strip()
-                    logger.warning(f"选课失败: {error_message[:200]}...")  # 记录前200个字符
+                    logger.error("服务器返回了HTML页面而非预期的选课结果")
+                return False
 
-                    # 检查是否是因为会话过期
-                    if "登录" in error_message or "session" in error_message.lower():
-                        logger.warning("会话可能已过期，尝试刷新选课参数...")
-                        self.get_election_params()
-                        time.sleep(1)
-                        continue
+            # 检查选课结果
+            result_text = response.text.strip()
+            logger.debug(f"选课响应: {result_text}")
 
-                # 如果到这里还没有返回，说明是其他类型的错误，继续下一次尝试
-                time.sleep(1)
+            if "成功" in result_text:
+                logger.info(f"成功选上课程 {course_id}")
+                return True
+            elif "已选" in result_text:
+                logger.info(f"课程 {course_id} 已经选过")
+                return True
+            else:
+                logger.warning(f"选课失败: {result_text[:200]}")
+                return False
 
-            except Exception as e:
-                logger.error(f"选课过程出错 (尝试 {attempt+1}/{max_retries}): {str(e)}")
-                time.sleep(2)  # 出错后等待时间更长
-
-        # 如果所有重试都失败了
-        logger.error(f"在 {max_retries} 次尝试后仍无法成功选课 {course_id}")
-        return False
+        except requests.exceptions.Timeout:
+            logger.error("选课请求超时")
+            return False
+        except Exception as e:
+            logger.error(f"选课过程出错: {str(e)}")
+            return False
 
     def auto_snipe(self, course_ids, interval=1, max_attempts=100):
         """自动抢课"""
