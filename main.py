@@ -176,24 +176,57 @@ class SMUCourseSniper:
             'Referer': f"{self.jwxt_base_url}/shmtu/stdElectCourse!defaultPage.action?electionProfile.id={self.profile_id}"
         }
 
-        try:
-            response = self.session.post(select_url, data=select_data, headers=headers)
-            response.raise_for_status()
+        # 增加重试次数以应对临时性错误
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                response = self.session.post(select_url, data=select_data, headers=headers)
 
-            # 检查选课结果
-            if "成功" in response.text or "success" in response.text.lower():
-                logger.info(f"成功选上课程 {course_id}")
-                return True
-            elif "已选" in response.text:
-                logger.info(f"课程 {course_id} 已经选过")
-                return True
-            else:
-                logger.warning(f"选课失败: {response.text[:100]}")  # 只记录前100个字符避免日志过长
-                return False
+                # 检查HTTP状态码
+                if response.status_code != 200:
+                    logger.warning(f"选课请求HTTP状态码异常: {response.status_code}")
+                    time.sleep(1)  # 短暂等待后重试
+                    continue
 
-        except Exception as e:
-            logger.error(f"选课过程出错: {str(e)}")
-            return False
+                # 检查响应内容
+                if "NullPointerException" in response.text or "服务器内部错误" in response.text:
+                    logger.warning("服务器遇到空指针异常，正在重新获取选课参数并重试...")
+                    # 重新生成选课时间戳并重试
+                    self.elec_session_time = time.strftime("%Y%m%d%H%M%S", time.localtime())
+                    # 刷新选课页面以确保session有效
+                    refresh_resp = self.session.get(f"{self.jwxt_base_url}/shmtu/stdElectCourse!defaultPage.action?electionProfile.id={self.profile_id}")
+                    time.sleep(2)  # 等待更长时间
+                    continue
+
+                # 检查选课结果
+                if "成功" in response.text or "success" in response.text.lower():
+                    logger.info(f"成功选上课程 {course_id}")
+                    return True
+                elif "已选" in response.text:
+                    logger.info(f"课程 {course_id} 已经选过")
+                    return True
+                else:
+                    # 记录更完整的错误信息
+                    error_message = response.text.strip()
+                    logger.warning(f"选课失败: {error_message[:200]}...")  # 记录前200个字符
+
+                    # 检查是否是因为会话过期
+                    if "登录" in error_message or "session" in error_message.lower():
+                        logger.warning("会话可能已过期，尝试刷新选课参数...")
+                        self.get_election_params()
+                        time.sleep(1)
+                        continue
+
+                # 如果到这里还没有返回，说明是其他类型的错误，继续下一次尝试
+                time.sleep(1)
+
+            except Exception as e:
+                logger.error(f"选课过程出错 (尝试 {attempt+1}/{max_retries}): {str(e)}")
+                time.sleep(2)  # 出错后等待时间更长
+
+        # 如果所有重试都失败了
+        logger.error(f"在 {max_retries} 次尝试后仍无法成功选课 {course_id}")
+        return False
 
     def auto_snipe(self, course_ids, interval=1, max_attempts=100):
         """自动抢课"""
