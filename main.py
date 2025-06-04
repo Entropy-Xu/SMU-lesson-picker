@@ -195,7 +195,6 @@ class SMUCourseSniper:
             }
 
             # 构建选课数据，与浏览器真实请求完全一致
-            # 检查请求数据格式是否正确 - 需特别注意参数顺序和格式
             form_data = {
                 'profileId': self.profile_id,
                 'elecSessionTime': self.elec_session_time,
@@ -215,29 +214,41 @@ class SMUCourseSniper:
                 logger.error(f"选课请求返回异常状态码: {response.status_code}")
                 return False
 
-            # 如果返回HTML页面而非JSON数据，表示发生了错误
+            # 如果返回HTML页面而非JSON数据，可能是选课失败或服务器错误
             if "<!DOCTYPE html" in response.text or "<html" in response.text:
                 if "NullPointerException" in response.text:
                     logger.error("服务器发生空指针异常，可能是请求参数格式不正确或服务器bug")
                     # 记录请求详情以便调试
                     logger.debug(f"请求URL: {batch_url}")
                     logger.debug(f"请求数据: {form_data}")
+                    return False
                 else:
-                    logger.error("服务器返回了HTML页面而非预期的选课结果")
-                return False
+                    # ���析失败原因并显示给用户
+                    # 同时将完整原始响应记录到日志
+                    logger.debug(f"选课失败，原始响应:\n{response.text}")
+                    failure_reason = self.parse_failure_reason(response.text)
+                    logger.warning(failure_reason)
+                    print(f"\n{failure_reason}\n")  # 直接在控制台显示失败原因
+                    return False
 
             # 检查选课结果
             result_text = response.text.strip()
             logger.debug(f"选课响应: {result_text}")
 
             if "成功" in result_text:
-                logger.info(f"成功选上课程 {course_id}")
+                success_msg = f"成功选上课程 {course_id}"
+                logger.info(success_msg)
+                print(f"\n{success_msg}\n")
                 return True
             elif "已选" in result_text:
-                logger.info(f"课程 {course_id} 已经选过")
+                already_msg = f"课程 {course_id} 已经选过"
+                logger.info(already_msg)
+                print(f"\n{already_msg}\n")
                 return True
             else:
-                logger.warning(f"选课失败: {result_text[:200]}")
+                error_msg = f"选课失败: {result_text[:200]}"
+                logger.warning(error_msg)
+                print(f"\n{error_msg}\n")
                 return False
 
         except requests.exceptions.Timeout:
@@ -356,6 +367,75 @@ class SMUCourseSniper:
         except ValueError:
             logger.error("请输入有效的数字")
             return False
+
+    def parse_failure_reason(self, html_response):
+        """解析选课失败原因，从HTML响应中提取有用信息"""
+        try:
+            # 检查是否是HTML/CSS内容
+            if html_response and ("<style" in html_response or "<html" in html_response):
+                # 首先尝试提取 "选课失败:" 后面的文本
+                failure_match = re.search(r'选课失败:\s*([^<]+)', html_response)
+                if failure_match and failure_match.group(1).strip():
+                    return f"选课失败: {failure_match.group(1).strip()}"
+
+                # 使用BeautifulSoup解析HTML
+                soup = BeautifulSoup(html_response, 'html.parser')
+
+                # 删除所有样式和脚本标签
+                for tag in soup(['style', 'script']):
+                    tag.decompose()
+
+                # 尝试查找错误信息
+                error_div = soup.find('div', {'class': 'error'}) or soup.find('div', style=lambda s: s and 'color:red' in s)
+                if error_div:
+                    error_text = error_div.get_text(strip=True)
+                    if error_text:
+                        return f"选课失败: {error_text}"
+
+                # 尝试查找弹窗提示内容
+                alert_div = soup.find('div', {'class': 'co'}) or soup.find('div', id=lambda i: i and 'alert' in i.lower())
+                if alert_div:
+                    alert_text = alert_div.get_text(strip=True)
+                    if alert_text and len(alert_text) > 5:
+                        return f"选课失败: {alert_text}"
+
+                # 提取正文内容，查找可能的错误消息
+                body = soup.find('body')
+                if body:
+                    # 移除所有可能存在的隐藏元素
+                    for hidden in body.find_all(style=lambda s: s and ('display:none' in s or 'visibility:hidden' in s)):
+                        hidden.decompose()
+
+                    # 获取文本内容
+                    text = body.get_text(separator=' ', strip=True)
+
+                    # 查找可能的错误信息短语
+                    for phrase in ["选课失败", "失败原因", "错误", "人数已满", "冲突", "请重试"]:
+                        if phrase in text:
+                            # 提取包含该短语的句子或短文本
+                            position = text.find(phrase)
+                            start = max(0, position - 20)
+                            end = min(len(text), position + 100)
+                            context = text[start:end].strip()
+                            return f"选课失败: {context}..."
+
+                # 如果无法从HTML中提取���效信息，返回简化消息
+                return "选课失败: 服务器返回了HTML页面，无法解析具体原因，请稍后再试"
+
+            # 如果是纯文本响应
+            elif html_response:
+                if "选课失败" in html_response:
+                    # 尝试获取"选课失败:"后面的内容
+                    match = re.search(r'选课失败:\s*(.*)', html_response)
+                    if match:
+                        return f"选课失败: {match.group(1).strip()}"
+                return f"选课失败: {html_response.strip()}"
+            else:
+                return "选课失败: 服务器未返回任何信息"
+
+        except Exception as e:
+            logger.error(f"解析失败原因出错: {str(e)}")
+            return f"无法解析选课失败原因: {str(e)}"
 
 
 def main():
